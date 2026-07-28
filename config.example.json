@@ -1,0 +1,93 @@
+{
+  "_comment": "Copy this file to config.json (same folder as run_qdm_daily.ps1) and edit. Symbols are grouped by data source; each source can have its own export timezone.",
+  "QdmDir": "D:\\Trading\\QuantDataManager124",
+  "Mt5CommonOverride": "",
+  "_Mt5CommonOverride_comment": "Leave empty to auto-use %APPDATA%\\MetaQuotes\\Terminal\\Common\\Files\\QDM. Set only for portable/non-standard MT5 installs.",
+  "WindowDays": 7,
+  "FullFromDate": "2011.01.01",
+  "_FullFromDate_comment": "History depth for -Full runs, format yyyy.MM.dd. Empty string = everything QDM has.",
+  "TickBatchSize": 3,
+  "_TickBatchSize_comment": "Tick exports run in sequential batches of this many symbols. Bounds disk usage and avoids QDM's silent same-symbol job drops.",
+  "MinFreeSpaceGB": 60,
+  "_MinFreeSpaceGB_comment": "-Full runs abort if the MT5 Common drive has less free space than this. Full-history tick CSVs are 5-20 GB per symbol.",
+  "DoneRetentionDays": 3,
+  "_DoneRetentionDays_comment": "Files in done\\ older than this many days are purged at each run start. Only relevant when the service's InpDonePolicy is 'move' (default is 'delete'). Set -1 to never purge.",
+  "Sources": {
+    "_comment": "Key = QDM datasource name (dukascopy, darwinex, crypto, yahoo...). Missing symbols are auto-registered with that source. Timezone is applied to exports via the CLI timezone= parameter and shifts every timestamp - Dukascopy's raw feed is UTC-native, so EETUS (UTC+2/UTC+3 with US DST) makes bars/ticks match a typical MT5 broker's server time. IMPORTANT: changing a source's Timezone after symbols already have imported data means old (differently-shifted) and new bars will misalign - wipe the affected custom symbols and re-seed with -Full after any Timezone change. Custom symbols in MT5 are named <SYMBOL>_<source>.",
+    "dukascopy": {
+      "Timezone": "EETUS",
+      "M1Symbols": [
+        "AUDCAD",
+        "AUDCHF",
+        "AUDJPY",
+        "AUDNZD",
+        "AUDUSD",
+        "BTCUSD",
+        "CADCHF",
+        "CADJPY",
+        "CHFJPY",
+        "EURAUD",
+        "EURCAD",
+        "EURCHF",
+        "EURGBP",
+        "EURJPY",
+        "EURNZD",
+        "EURUSD",
+        "GBPAUD",
+        "GBPCAD",
+        "GBPCHF",
+        "GBPJPY",
+        "GBPNZD",
+        "GBPUSD",
+        "NZDCAD",
+        "NZDCHF",
+        "NZDJPY",
+        "NZDUSD",
+        "USDCAD",
+        "USDCHF",
+        "USDJPY",
+        "XAGUSD",
+        "XAUUSD"
+      ],
+      "TickSymbols": [
+        "EURUSD",
+        "GBPUSD",
+        "USDJPY",
+        "AUDUSD",
+        "USDCAD",
+        "USDCHF",
+        "NZDUSD",
+        "EURGBP",
+        "EURJPY",
+        "GBPJPY",
+        "XAGUSD",
+        "XAUUSD"
+      ]
+    },
+    "darwinex": {
+      "Timezone": "EETUS",
+      "M1Symbols": [
+        "GDAXIm",
+        "NDXm",
+        "SP500",
+        "UK100",
+        "WS30"
+      ],
+      "TickSymbols": [
+        "GDAXIm",
+        "NDXm",
+        "SP500",
+        "UK100",
+        "WS30"
+      ]
+    }
+  },
+  "Watchdog": {
+    "_comment": "Completion is normally detected via qdmcli self-exit or log markers. These values are only the last-resort fallback.",
+    "UpdateQuiesceSec": 900,
+    "UpdateTimeoutMin": 720,
+    "ExportQuiesceSec": 600,
+    "ExportTimeoutMin": 480,
+    "MinPhaseRunSec": 120
+  }
+}
