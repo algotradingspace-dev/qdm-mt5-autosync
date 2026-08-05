@@ -10,13 +10,17 @@ After a one-time setup, the pipeline runs itself:
 Windows Task Scheduler (daily)
   └─ run_qdm_daily.ps1
        ├─ Phase 1: qdmcli -data action=update      (incremental Dukascopy download)
-       └─ Phase 2: qdmcli -data action=export      (rolling 7-day CSV window)
+       ├─ Phase 2: qdmcli -data action=export      (rolling backfill CSV window)
+       ├─ Phase 3: per-source tick export batches
+       ├─ Phase 4: reconcile MT5 coverage per symbol (provider-lag aware)
+       └─ Phase 5: auto-backfill the missing range for any symbol that's behind
             └─ %APPDATA%\MetaQuotes\Terminal\Common\Files\QDM\{M1,TICK}\*.csv
                  └─ QdmImporter (MQL5 Service inside MT5)
                       ├─ creates custom symbols automatically, cloned from
                       │  your broker's specs (digits, contract size, sessions)
                       ├─ merges bars via CustomRatesUpdate  → idempotent
                       ├─ replaces tick windows via CustomTicksReplace
+                      ├─ writes per-symbol status files (last stored bar/tick)
                       └─ archives processed CSVs to done\
 ```
 
@@ -94,10 +98,13 @@ schtasks /Delete /TN "QDM-MT5-DailySync" /F
 |---|---|
 | `QdmDir` | QuantDataManager install folder (must contain `qdmcli.exe`) |
 | `Mt5CommonOverride` | Leave `""` to auto-use `%APPDATA%\MetaQuotes\Terminal\Common\Files\QDM`; set only for non-standard MT5 installs |
-| `WindowDays` | Rolling export window for daily runs (days) |
+| `WindowDays` | Rolling export window for daily runs (days). A per-source `BackfillWindowDays` overrides it. |
 | `FullFromDate` | History depth for `-Full` runs, `yyyy.MM.dd`; empty = everything QDM has |
-| `Sources` | Map of QDM data source → symbol lists. Each source (e.g. `dukascopy`, `darwinex`, `crypto`, `yahoo`) carries its own `Timezone`, `M1Symbols`, and `TickSymbols`. Symbols missing from your QDM registry are **auto-registered** under their source (full history downloads during the next update phase); names the source doesn't offer fail registration and are dropped with a warning. |
+| `Sources` | Map of QDM data source → symbol lists. Each source (e.g. `dukascopy`, `darwinex`, `crypto`, `yahoo`) carries its own `Timezone`, `ProviderLagDays`, `BackfillWindowDays`, `M1Symbols`, and `TickSymbols`. Symbols missing from your QDM registry are **auto-registered** under their source (full history downloads during the next update phase); names the source doesn't offer fail registration and are dropped with a warning. |
 | `Sources.<name>.Timezone` | Applied at export time via the CLI `timezone=` parameter. Empty = source-native (UTC for Dukascopy). List valid names with `qdmcli.exe -data action=timezones`; `EETUS` = UTC+2 with US DST, the typical MT5 broker time. |
+| `Sources.<name>.ProviderLagDays` | Expected publication delay for that source (dukascopy 0, darwinex 2). Data missing within `now − lag` is normal; anything beyond that is flagged/repaired. |
+| `Sources.<name>.BackfillWindowDays` | How far each source's exports look back (default 14). Keep it > `ProviderLagDays` so late-published provider data still lands inside the export window before it ages out. |
+| `Reconcile` | (Optional) block toggling coverage verification + auto-backfill: `Enabled`, `StatusDir`, `ProviderLagDays`, `MarginDays`, `ReportDir`. When absent, the pipeline runs as before but exports use `BackfillWindowDays`. |
 | `TickBatchSize` | Tick exports run in sequential batches of this many symbols (default 3). Bounds peak disk usage and avoids QDM silently dropping a job for a symbol already busy in another job. Between batches the script waits for the importer to drain the source's TICK folder. |
 | `MinFreeSpaceGB` | `-Full` runs abort below this free space on the MT5 Common drive (full-history tick CSVs are 5–20 GB per symbol) |
 | `Watchdog.*` | Fallback-only timing; defaults are sane, only tune if you see `FALLBACK STOP` warnings |
@@ -118,13 +125,16 @@ A note on QDM/SQX **broker profiles**: they configure broker timezone plus broke
 | `InpCustomPostfix` | `.QDM` | custom symbol naming |
 | `InpBrokerSuffixes` | `,.a,.r,m,…` | suffix candidates for finding the broker symbol to clone specs from |
 | `InpDonePolicy` | `move` | `move` / `delete` / `keep` processed files |
+| `InpStatusDir` | `status` | subfolder under the watch dir where per-symbol coverage status (`<custom>.json`) is written — read by the runner's reconcile pass to auto-backfill gaps. Empty disables it. |
 | `InpScanMinutes` | `15` | folder scan interval |
 
 ## Design notes & data facts
 
 **M1 for everything, ticks for the few.** MT5 computes all higher timeframes from M1, and "Every tick based on real 1-minute" covers most backtesting needs. Full tick history runs 10–20 GB *per symbol*; reserve it for symbols you genuinely test in real-tick mode. MT5 **cannot** build higher timeframes from tick data alone — M1 must always be imported alongside.
 
-**Idempotent by construction.** Bar imports merge; tick imports replace exactly the window each file covers. Overlapping exports, re-runs, and missed days that later backfill are all safe. The daily 7-day window means any single failed run self-heals the next morning.
+**Idempotent by construction.** Bar imports merge; tick imports replace exactly the window each file covers. Overlapping exports, re-runs, and missed days that later backfill are all safe.
+
+**Providers can publish late — handled.** Some sources (e.g. darwinex) can lag a day or two, so a given calendar day may only appear in QDM's store later. The exported window is per-source (`BackfillWindowDays`, default 14) and `QdmImporter` writes per-symbol status so the runner's reconcile pass compares what MT5 actually holds against `now − ProviderLagDays` and re-exports the missing range for any behind symbol. A genuine gap self-heals on the next run instead of aging out of a fixed 7-day window.
 
 **Async CLI, handled.** `qdmcli` dispatches `-data` jobs asynchronously — a naive script with `-exit` in the command file kills the jobs before they run (a several-hour update "finishes" in one second). This script launches phases without `-exit` and detects completion via process self-exit and log markers, with a long disk-quiescence window only as a warned fallback.
 
