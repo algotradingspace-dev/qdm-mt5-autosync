@@ -12,10 +12,23 @@
   "_MinFreeSpaceGB_comment": "-Full runs abort if the MT5 Common drive has less free space than this. Full-history tick CSVs are 5-20 GB per symbol.",
   "DoneRetentionDays": 3,
   "_DoneRetentionDays_comment": "Files in done\\ older than this many days are purged at each run start. Only relevant when the service's InpDonePolicy is 'move' (default is 'delete'). Set -1 to never purge.",
+  "Reconcile": {
+    "_comment": "(Optional) Verify what actually landed in MT5 and auto-backfill gaps. When absent/disabled, the pipeline runs as before except exports use BackfillWindowDays.",
+    "Enabled": true,
+    "StatusDir": "",
+    "_StatusDir_comment": "Where QdmImporter writes per-symbol status files. Empty = <Mt5Common>\\status (alongside the watch root the service scans). Must match the service's InpStatusDir.",
+    "ProviderLagDays": 2,
+    "_ProviderLagDays_comment": "Global default expected publication delay (days). Per-source ProviderLagDays overrides. Gap up to this is normal; beyond it triggers reconcile/backfill.",
+    "MarginDays": 1,
+    "_MarginDays_comment": "Extra tolerance on top of lag before a day counts as a genuine gap (absorbs timezone/day-boundary fuzz).",
+    "ReportDir": ""
+  },
   "Sources": {
     "_comment": "Key = QDM datasource name (dukascopy, darwinex, crypto, yahoo...). Missing symbols are auto-registered with that source. Timezone is applied to exports via the CLI timezone= parameter and shifts every timestamp - Dukascopy's raw feed is UTC-native, so EETUS (UTC+2/UTC+3 with US DST) makes bars/ticks match a typical MT5 broker's server time. IMPORTANT: changing a source's Timezone after symbols already have imported data means old (differently-shifted) and new bars will misalign - wipe the affected custom symbols and re-seed with -Full after any Timezone change. Custom symbols in MT5 are named <SYMBOL>_<source>.",
     "dukascopy": {
       "Timezone": "EETUS",
+      "ProviderLagDays": 0,
+      "BackfillWindowDays": 14,
       "M1Symbols": [
         "AUDCAD",
         "AUDCHF",
@@ -66,6 +79,8 @@
     },
     "darwinex": {
       "Timezone": "EETUS",
+      "ProviderLagDays": 2,
+      "BackfillWindowDays": 14,
       "M1Symbols": [
         "GDAXIm",
         "NDXm",

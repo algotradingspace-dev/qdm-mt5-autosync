@@ -24,7 +24,7 @@
 //+------------------------------------------------------------------+
 #property service
 #property copyright "Algo Trading Space"
-#property version   "1.41"
+#property version   "1.42"
 #property strict
 
 //--- === IMPORT SETTINGS ===
@@ -36,6 +36,9 @@ input string InpDonePolicy      = "delete";   // After import: delete | move | k
 input int    InpScanMinutes     = 15;         // Folder scan interval (minutes)
 input int    InpChunkBars       = 200000;     // Bars per CustomRatesUpdate call
 input int    InpChunkTicks      = 500000;     // Ticks per CustomTicksReplace call
+
+//--- === COVERAGE STATUS (reconcile/backfill, see docs/data-gap-backfill.md) ===
+input string InpStatusDir       = "status";   // Status subfolder under InpWatchDir (empty = disabled); run_qdm_daily.ps1 reads it to detect/backfill gaps
 
 //--- === SYMBOL SETTINGS ===
 input string InpCustomPostfix   = ".QDM";     // LEGACY fallback only - naming for files with no source subfolder (unused with a Sources-based config.json)
@@ -235,13 +238,19 @@ bool ImportFile(const string path, const string fname, const string forceTf, con
       return false;
 
    bool ok;
+   datetime lastBar  = 0;
+   datetime lastTick = 0;
    if(tf == "TICK")
-      ok = ImportTicks(path, custom);
+      ok = ImportTicks(path, custom, lastTick);
    else
-      ok = ImportBars(path, custom);
+      ok = ImportBars(path, custom, lastBar);
 
-   if(ok && InpVerbose)
-      PrintFormat("[QdmImporter] OK  %s -> %s (%s)", fname, custom, tf);
+   if(ok)
+     {
+      if(InpVerbose)
+         PrintFormat("[QdmImporter] OK  %s -> %s (%s)", fname, custom, tf);
+      WriteStatus(custom, srcTag, tf, lastBar, lastTick);
+     }
    return ok;
   }
 
@@ -361,49 +370,53 @@ string FindBrokerSymbol(const string base)
 //+------------------------------------------------------------------+
 //| BAR IMPORT                                                       |
 //+------------------------------------------------------------------+
-bool ImportBars(const string path, const string custom)
-  {
-   int fh = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI | FILE_COMMON);
-   if(fh == INVALID_HANDLE)
-     {
-      PrintFormat("[QdmImporter] cannot open %s, err=%d", path, GetLastError());
-      return false;
-     }
+bool ImportBars(const string path, const string custom, datetime &lastBar)
+   {
+    int fh = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI | FILE_COMMON);
+    if(fh == INVALID_HANDLE)
+      {
+       PrintFormat("[QdmImporter] cannot open %s, err=%d", path, GetLastError());
+       return false;
+      }
 
-   MqlRates rates[];
-   ArrayResize(rates, 0, InpChunkBars);
-   long totalBars = 0;
-   int  badLines  = 0;
+    MqlRates rates[];
+    ArrayResize(rates, 0, InpChunkBars);
+    long totalBars = 0;
+    int  badLines  = 0;
+    lastBar = 0;
 
-   while(!FileIsEnding(fh))
-     {
-      string line = FileReadString(fh);
-      if(StringLen(line) < 10)
-         continue;
+    while(!FileIsEnding(fh))
+      {
+       string line = FileReadString(fh);
+       if(StringLen(line) < 10)
+          continue;
 
-      MqlRates r;
-      if(!ParseBarLine(line, r))
-        {
-         badLines++;
-         continue;
-        }
+       MqlRates r;
+       if(!ParseBarLine(line, r))
+         {
+          badLines++;
+          continue;
+         }
 
-      int n = ArraySize(rates);
-      ArrayResize(rates, n + 1, InpChunkBars);
-      rates[n] = r;
+       if(r.time > lastBar)
+          lastBar = r.time;
 
-      if(n + 1 >= InpChunkBars)
-        {
-         if(!FlushBars(custom, rates))
-           {
-            FileClose(fh);
-            return false;
-           }
-         totalBars += ArraySize(rates);
-         ArrayResize(rates, 0, InpChunkBars);
-        }
-     }
-   FileClose(fh);
+       int n = ArraySize(rates);
+       ArrayResize(rates, n + 1, InpChunkBars);
+       rates[n] = r;
+
+       if(n + 1 >= InpChunkBars)
+         {
+          if(!FlushBars(custom, rates))
+            {
+             FileClose(fh);
+             return false;
+            }
+          totalBars += ArraySize(rates);
+          ArrayResize(rates, 0, InpChunkBars);
+         }
+      }
+    FileClose(fh);
 
    if(ArraySize(rates) > 0)
      {
@@ -488,49 +501,54 @@ bool ParseBarLine(const string line, MqlRates &r)
 //+------------------------------------------------------------------+
 //| TICK IMPORT                                                      |
 //+------------------------------------------------------------------+
-bool ImportTicks(const string path, const string custom)
-  {
-   int fh = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI | FILE_COMMON);
-   if(fh == INVALID_HANDLE)
-     {
-      PrintFormat("[QdmImporter] cannot open %s, err=%d", path, GetLastError());
-      return false;
-     }
+bool ImportTicks(const string path, const string custom, datetime &lastTick)
+   {
+    int fh = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI | FILE_COMMON);
+    if(fh == INVALID_HANDLE)
+      {
+       PrintFormat("[QdmImporter] cannot open %s, err=%d", path, GetLastError());
+       return false;
+      }
 
-   MqlTick ticks[];
-   ArrayResize(ticks, 0, InpChunkTicks);
-   long totalTicks = 0;
-   int  badLines   = 0;
+    MqlTick ticks[];
+    ArrayResize(ticks, 0, InpChunkTicks);
+    long totalTicks = 0;
+    int  badLines   = 0;
+    lastTick = 0;
 
-   while(!FileIsEnding(fh))
-     {
-      string line = FileReadString(fh);
-      if(StringLen(line) < 10)
-         continue;
+    while(!FileIsEnding(fh))
+      {
+       string line = FileReadString(fh);
+       if(StringLen(line) < 10)
+          continue;
 
-      MqlTick t;
-      if(!ParseTickLine(line, t))
-        {
-         badLines++;
-         continue;
-        }
+       MqlTick t;
+       if(!ParseTickLine(line, t))
+         {
+          badLines++;
+          continue;
+         }
 
-      int n = ArraySize(ticks);
-      ArrayResize(ticks, n + 1, InpChunkTicks);
-      ticks[n] = t;
+       datetime tsec = (datetime)(t.time_msc / 1000);
+       if(tsec > lastTick)
+          lastTick = tsec;
 
-      if(n + 1 >= InpChunkTicks)
-        {
-         if(!FlushTicks(custom, ticks))
-           {
-            FileClose(fh);
-            return false;
-           }
-         totalTicks += ArraySize(ticks);
-         ArrayResize(ticks, 0, InpChunkTicks);
-        }
-     }
-   FileClose(fh);
+       int n = ArraySize(ticks);
+       ArrayResize(ticks, n + 1, InpChunkTicks);
+       ticks[n] = t;
+
+       if(n + 1 >= InpChunkTicks)
+         {
+          if(!FlushTicks(custom, ticks))
+            {
+             FileClose(fh);
+             return false;
+            }
+          totalTicks += ArraySize(ticks);
+          ArrayResize(ticks, 0, InpChunkTicks);
+         }
+      }
+    FileClose(fh);
 
    if(ArraySize(ticks) > 0)
      {
@@ -705,5 +723,65 @@ void FinishFile(const string path, const string fname, const string tfTag, const
    string dst = InpWatchDir + "\\done\\" + stamp + "_" + tagPart + fname;
    if(!FileMove(path, FILE_COMMON, dst, FILE_REWRITE | FILE_COMMON))
       PrintFormat("[QdmImporter] warn: could not move %s to done\\, err=%d", fname, GetLastError());
+  }
+
+//+------------------------------------------------------------------+
+//| Coverage status (docs/data-gap-backfill.md). Writes per-symbol   |
+//| JSON under <watch>\<InpStatusDir>\<custom>.json so the runner    |
+//| (run_qdm_daily.ps1 reconcile pass) can verify what MT5 actually  |
+//| holds and auto-backfill late-published provider data.            |
+//| Status is written on every successful import, independent of the |
+//| DonePolicy (file may be kept/deleted after, the record persists).|
+//+------------------------------------------------------------------+
+void WriteStatus(const string custom, const string srcTag, const string tf,
+                 const datetime lastBar, const datetime lastTick)
+  {
+   if(InpStatusDir == "")
+      return;
+
+   string dir = InpWatchDir + "\\" + InpStatusDir;
+   FolderCreate(dir, FILE_COMMON);
+
+   string path = dir + "\\" + custom + ".json";
+
+   // read existing record so a M1 write doesn't clobber the TICK value and vice versa
+   datetime prevBar  = 0;
+   datetime prevTick = 0;
+   int rf = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   if(rf != INVALID_HANDLE)
+     {
+      string all = "";
+      while(!FileIsEnding(rf))
+         all += FileReadString(rf, 32768);
+      FileClose(rf);
+      // crude scan for the two timestamps: "lastBarTime":"...","lastTickTime":"..."
+      int b = StringFind(all, "\"lastBarTime\"");
+      int t = StringFind(all, "\"lastTickTime\"");
+      prevBar  = (b >= 0) ? (datetime)StringToInteger(StringSubstr(all, StringFind(all, ":", b) + 1, 10)) : 0;
+      prevTick = (t >= 0) ? (datetime)StringToInteger(StringSubstr(all, StringFind(all, ":", t) + 1, 10)) : 0;
+     }
+
+   if(lastBar > prevBar)     prevBar  = lastBar;
+   if(lastTick > prevTick)   prevTick = lastTick;
+
+   int wf = FileOpen(path, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   if(wf == INVALID_HANDLE)
+     {
+      PrintFormat("[QdmImporter] cannot write status %s, err=%d", path, GetLastError());
+      return;
+     }
+   string body = "{";
+   body += "\"symbol\":\"" + custom + "\",";
+   body += "\"source\":\"" + srcTag + "\",";
+   body += "\"tf\":\"" + tf + "\",";
+   body += "\"lastBarTime\":" + IntegerToString((long)prevBar, 0) + ",";
+   body += "\"lastTickTime\":" + IntegerToString((long)prevTick, 0) + ",";
+   body += "\"updated\":\"" + TimeToString(TimeLocal(), TIME_DATE | TIME_SECONDS) + "\"";
+   body += "}";
+   FileWrite(wf, body);
+   FileClose(wf);
+
+   if(InpVerbose)
+      PrintFormat("[QdmImporter] status %s: bar=%ld tick=%ld", custom, (long)prevBar, (long)prevTick);
   }
 //+------------------------------------------------------------------+

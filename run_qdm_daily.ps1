@@ -79,6 +79,17 @@ $FullFromDate   = [string]$cfg.FullFromDate
 $TickBatchSize  = [int](Get-CfgVal "TickBatchSize" 3)
 $MinFreeSpaceGB = [int](Get-CfgVal "MinFreeSpaceGB" 60)
 
+# --- reconcile + backfill (data-gap-backfill.md) -----------------------------
+# Global fallbacks, overridden per-source in the Sources:<name> block.
+$GlobalProviderLag = [int](Get-CfgVal "ProviderLagDays" 2)
+$GlobalBackfill    = [int](Get-CfgVal "BackfillWindowDays" 14)
+if ($cfg.PSObject.Properties.Name -contains "Reconcile") { $recon = $cfg.Reconcile } else { $recon = $null }
+$ReconcileEnabled = if ($recon -and $recon.PSObject.Properties.Name -contains "Enabled" -and $null -ne $recon.Enabled) { [bool]$recon.Enabled } else { $true }
+if ($recon -and $recon.PSObject.Properties.Name -contains "ProviderLagDays") { $GlobalProviderLag = [int]$recon.ProviderLagDays }
+$ReconcileMarginDays = if ($recon -and $recon.PSObject.Properties.Name -contains "MarginDays") { [int]$recon.MarginDays } else { 1 }
+$ReconcileStatusDir  = if ($recon -and $recon.PSObject.Properties.Name -contains "StatusDir" -and "$($recon.StatusDir)" -ne "") { [string]$recon.StatusDir } else { "" }
+$ReconcileReportDir  = if ($recon -and $recon.PSObject.Properties.Name -contains "ReportDir" -and "$($recon.ReportDir)" -ne "") { [string]$recon.ReportDir } else { "" }
+
 # --- sources: name -> { Timezone, M1Symbols[], TickSymbols[] } --------------
 $SourceList = @()   # array of PSCustomObject: Name, Timezone, M1, Tick
 if ($cfg.PSObject.Properties.Name -contains "Sources") {
@@ -88,6 +99,8 @@ if ($cfg.PSObject.Properties.Name -contains "Sources") {
         $SourceList += [pscustomobject]@{
             Name     = $p.Name
             Timezone = if ($s.PSObject.Properties.Name -contains "Timezone") { [string]$s.Timezone } else { "" }
+            ProviderLagDays   = if ($s.PSObject.Properties.Name -contains "ProviderLagDays")   { [int]$s.ProviderLagDays }   else { $GlobalProviderLag }
+            BackfillWindowDays= if ($s.PSObject.Properties.Name -contains "BackfillWindowDays"){ [int]$s.BackfillWindowDays } else { $GlobalBackfill }
             M1       = if ($s.PSObject.Properties.Name -contains "M1Symbols")   { @($s.M1Symbols) }   else { @() }
             Tick     = if ($s.PSObject.Properties.Name -contains "TickSymbols") { @($s.TickSymbols) } else { @() }
         }
@@ -97,6 +110,8 @@ if ($cfg.PSObject.Properties.Name -contains "Sources") {
     $SourceList += [pscustomobject]@{
         Name     = [string](Get-CfgVal "DataSource" "dukascopy")
         Timezone = ""
+        ProviderLagDays   = $GlobalProviderLag
+        BackfillWindowDays= $GlobalBackfill
         M1       = @($cfg.M1Symbols)
         Tick     = if ($cfg.PSObject.Properties.Name -contains "TickSymbols") { @($cfg.TickSymbols) } else { @() }
     }
@@ -186,11 +201,12 @@ Write-Host " QDM dir        : $QdmDir" -ForegroundColor Cyan
 Write-Host " MT5 Common\QDM : $Mt5Common" -ForegroundColor Cyan
 foreach ($s in $SourceList) {
     $tz = if ($s.Timezone) { $s.Timezone } else { "native/UTC" }
-    Write-Host " [$($s.Name)] tz=$tz | M1: $($s.M1.Count) | Tick: $($s.Tick.Count)" -ForegroundColor Cyan
+    Write-Host " [$($s.Name)] tz=$tz lag=$($s.ProviderLagDays)d backfill=$($s.BackfillWindowDays)d | M1: $($s.M1.Count) | Tick: $($s.Tick.Count)" -ForegroundColor Cyan
     Write-Host "    M1  : $($s.M1 -join ', ')" -ForegroundColor Cyan
     if ($s.Tick.Count -gt 0) { Write-Host "    Tick: $($s.Tick -join ', ')" -ForegroundColor Cyan }
 }
 Write-Host " Window days: $WindowDays | Full-seed from: $(if ($FullFromDate) {$FullFromDate} else {'(all history)'}) | Tick batch: $TickBatchSize" -ForegroundColor Cyan
+Write-Host " Reconcile: $ReconcileEnabled | global lag: $GlobalProviderLag d | margin: $ReconcileMarginDays d" -ForegroundColor Cyan
 Write-Host "========================================================================`n" -ForegroundColor Cyan
 
 # --- QDM is single-instance ------------------------------------------------
@@ -400,10 +416,17 @@ Invoke-QdmPhase -Lines @("-data action=update") -CompleteCheck $CheckUpdate `
 
 # common export bits
 $tickFmt = 'format="Generic tick format (comma delimited)"'   # default format is a BAR format -> zero-price garbage for ticks
-if ($Full) {
-    $fromArg = if ($FullFromDate -ne "") { "datefrom=$FullFromDate " } else { "" }
-} else {
-    $fromArg = "datefrom=" + (Get-Date).AddDays(-$WindowDays).ToString("yyyy.MM.dd") + " "
+
+# Per-source export window (data-gap-backfill.md): each source exports back
+# as far as its BackfillWindowDays (which must exceed ProviderLagDays) so
+# late-published provider data still falls inside the lookup before aging out.
+function Get-FromArg([object]$Source, [int]$LookbackDays) {
+    if ($Full) {
+        return if ($FullFromDate -ne "") { "datefrom=$FullFromDate " } else { "" }
+    }
+    $days = if ($LookbackDays -gt 0) { $LookbackDays } else { $Source.BackfillWindowDays }
+    if ($days -lt 1) { $days = $WindowDays }
+    return "datefrom=" + (Get-Date).AddDays(-$days).ToString("yyyy.MM.dd") + " "
 }
 
 function Wait-TickFolderDrained { param([string]$Folder, [int]$MaxWaitMin = 90)
@@ -432,14 +455,171 @@ function Wait-TickFolderDrained { param([string]$Folder, [int]$MaxWaitMin = 90)
     Write-Warning "Continuing anyway - a persistently stuck file will cause this warning on every future batch until removed or fixed."
 }
 
+# =============================================================================
+# PHASE 4+5 - reconcile MT5 coverage vs expected, auto-backfill genuine gaps
+# (design: docs/data-gap-backfill.md)
+# QdmImporter writes, per custom symbol, a status file with the latest
+# stored bar/tick time under the MT5 Common state dir. We compare that to
+# "now - ProviderLagDays - margin" and re-export the missing range when behind.
+# =============================================================================
+function Resolve-StatusDir {
+    if ($ReconcileStatusDir -ne "") { return $ReconcileStatusDir }
+    # Default: alongside the watch root the service reads (Common\Files\QDM\status),
+    # which the runner and the terminal already share - independent of terminal portability.
+    return Join-Path $Mt5Common "status"
+}
+
+function Get-ExpectedCoverDate([object]$Source) {
+    # newest date we expect MT5 to already hold, in the source's exported TZ
+    $now = Get-Date
+    $lag = $Source.ProviderLagDays
+    $expected = $now.AddDays(-$lag)
+    # compare at day granularity in the source timezone when known
+    if ($Source.Timezone -ne "") {
+        try {
+            $tzi = [System.TimeZoneInfo]::FindSystemTimeZoneById($Source.Timezone)
+            $expectedLocal = [System.TimeZoneInfo]::ConvertTime($now, $tzi)
+            $expected = $expectedLocal.AddDays(-$lag)
+        } catch { }
+    }
+    return $expected
+}
+
+function Get-SourceStatusFile([object]$Source, [string]$Custom) {
+    $dir = Resolve-StatusDir
+    return Join-Path $dir ("$Custom.json")
+}
+
+# Read a status file. Returns a hashtable {lastBar/lastTick (UTC datetime or null)}.
+# Timestamps are Unix epoch seconds (as written by QdmImporter WriteStatus).
+function Read-StatusFile([string]$Path) {
+    $h = @{ lastBar = $null; lastTick = $null }
+    if (-not (Test-Path $Path)) { return $h }
+    try {
+        $j = Get-Content $Path -Raw | ConvertFrom-Json
+        foreach ($pair in @(@{k='lastBarTime';dst='lastBar'}, @{k='lastTickTime';dst='lastTick'})) {
+            $v = $j.($pair.k)
+            if ($null -ne $v -and "$v" -ne "" -and [long]$v -gt 0) {
+                try { $h.($pair.dst) = [datetimeoffset]::FromUnixTimeSeconds([long]$v).LocalDateTime } catch { }
+            }
+        }
+    } catch { }
+    return $h
+}
+
+function Export-Range(
+    [object]$Source,
+    [string[]]$Symbols,
+    [string]$Tf,                # "M1" or "TICK"
+    [datetime]$FromDate         # start (inclusive); a recent gap, not full history
+) {
+    $tzArg = if ($Source.Timezone -ne "") { "timezone=$($Source.Timezone) " } else { "" }
+    $frm = "datefrom=" + $FromDate.ToString("yyyy.MM.dd") + " "
+    $fmt = if ($Tf -eq "TICK") { $tickFmt + " " } else { "" }
+    if ($Tf -eq "TICK") {
+        $outDir  = Join-Path $outTickRoot $Source.Name
+        $outDirF = $outDir -replace '\\','/'
+        for ($i = 0; $i -lt $Symbols.Count; $i += $TickBatchSize) {
+            $batch = @($Symbols[$i..([Math]::Min($i + $TickBatchSize - 1, $Symbols.Count - 1))])
+            $syms  = $batch -join ","
+            Invoke-QdmPhase -Lines @("-data action=export symbols=$syms timeframe=TICK ${frm}${tzArg}$fmt outputdir=$outDirF") `
+                            -CompleteCheck (New-ExportCheck -Expected $batch.Count) `
+                            -QuiesceSec $ExportQuiesceSec -TimeoutMin $ExportTimeoutMin -Phase "backfill-tick-$($Source.Name)"
+            Wait-TickFolderDrained -Folder $outDir
+        }
+    } else {
+        $outDir = (Join-Path $outM1Root $Source.Name) -replace '\\','/'
+        $syms   = $Symbols -join ","
+        Invoke-QdmPhase -Lines @("-data action=export symbols=$syms timeframe=M1 ${frm}${tzArg}outputdir=$outDir") `
+                        -CompleteCheck (New-ExportCheck -Expected $Symbols.Count) `
+                        -QuiesceSec $ExportQuiesceSec -TimeoutMin $ExportTimeoutMin -Phase "backfill-m1-$($Source.Name)"
+    }
+}
+
+function Invoke-Reconcile([object]$SourceList) {
+    $reportDir = if ($ReconcileReportDir -ne "") { $ReconcileReportDir } else { $LogDir }
+    New-Item -ItemType Directory -Force -Path (Resolve-StatusDir) | Out-Null
+    New-Item -ItemType Directory -Force -Path $reportDir | Out-Null
+    $report = [collections.generic.list[object]]::new()
+    $anyBackfill = $false
+
+    Write-Host "`n=== RECONCILE (provider-lag aware) ===" -ForegroundColor Cyan
+    foreach ($s in $SourceList) {
+        $expected = Get-ExpectedCoverDate -Source $s
+        $need = $expected.AddDays(-[double]$ReconcileMarginDays)
+
+        foreach ($tf in @("M1","TICK")) {
+            $syms = if ($tf -eq "M1") { $s.M1 } else { $s.Tick }
+            if ($syms.Count -eq 0) { continue }
+            foreach ($sym in $syms) {
+                $custom = "$sym`_$($s.Name)"
+                $st = Read-StatusFile (Get-SourceStatusFile $s $custom)
+                $last = if ($tf -eq "TICK") { $st.lastTick } else { $st.lastBar }
+                if ($null -eq $last) {
+                    Write-Warning "[$($s.Name)] $custom : no status file yet - cannot verify coverage (first run / service not upgraded?). Skipping backfill."
+                    continue
+                }
+                if ($last -ge $need) { continue }       # current enough, no action
+
+                # behind: classify severity
+                $behindDays = [math]::Round(($expected - $last).TotalDays, 1)
+                $severity = if ($behindDays -gt $s.BackfillWindowDays) { "aged-out" } else { "in-window" }
+                Write-Host "  [$($s.Name)] $custom $tf behind by $behindDays d (severity: $severity)"
+                $report.Add([pscustomobject]@{
+                    Source = $s.Name; Symbol = $custom; Tf = $tf
+                    Last   = $last.ToString("yyyy.MM.dd HH:mm:ss")
+                    Expected = $expected.ToString("yyyy.MM.dd HH:mm:ss")
+                    BehindDays = $behindDays; Severity = $severity
+                    Action = "backfill-$(if($severity -eq 'aged-out'){'now'}else{'daily'})"
+                })
+
+                # backfill the missing range (start = day after MT5's last stored)
+                $start = $last.AddDays(1)
+                Write-Host "  -> exporting $tf from $($start.ToString('yyyy.MM.dd'))"
+                Export-Range -Source $s -Symbols @($sym) -Tf $tf -FromDate $start
+                $anyBackfill = $true
+            }
+        }
+    }
+
+    if ($anyBackfill) {
+        Write-Host "`n=== RECONCILE: re-reading status after backfill ===" -ForegroundColor Cyan
+        # importer writes status asynchronously; give it a beat to consume the new files
+        Start-Sleep -Seconds 90
+        foreach ($s in $SourceList) {
+            $expected = Get-ExpectedCoverDate -Source $s
+            $need = $expected.AddDays(-[double]$ReconcileMarginDays)
+            foreach ($tf in @("M1","TICK")) {
+                $syms = if ($tf -eq "M1") { $s.M1 } else { $s.Tick }
+                foreach ($sym in $syms) {
+                    $custom = "$sym`_$($s.Name)"
+                    $st = Read-StatusFile (Get-SourceStatusFile $s $custom)
+                    $last = if ($tf -eq "TICK") { $st.lastTick } else { $st.lastBar }
+                    if ($null -ne $last -and $last -ge $need) {
+                        Write-Host "  OK  $custom ($tf) caught up to $($last.ToString('yyyy.MM.dd'))" -ForegroundColor Green
+                    }
+                }
+            }
+        }
+    }
+
+    $reportFile = Join-Path $reportDir "gaps_$stamp.json"
+    $report | ConvertTo-Json -Depth 4 | Set-Content -Path $reportFile -Encoding UTF8
+    if ($report.Count -gt 0) {
+        $report | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $reportDir "gaps_latest.json") -Encoding UTF8
+    }
+    Write-Host "Reconcile report: $reportFile ($($report.Count) gap(s))"
+}
+
 # PHASE 2 + 3 - per-source exports
 foreach ($s in $SourceList) {
     $tzArg = if ($s.Timezone -ne "") { "timezone=$($s.Timezone) " } else { "" }
+    $winArg = Get-FromArg -Source $s -LookbackDays 0
 
     if ($s.M1.Count -gt 0) {
         $outDir = (Join-Path $outM1Root $s.Name) -replace '\\','/'
         $syms   = $s.M1 -join ","
-        Invoke-QdmPhase -Lines @("-data action=export symbols=$syms timeframe=M1 ${fromArg}${tzArg}outputdir=$outDir") `
+        Invoke-QdmPhase -Lines @("-data action=export symbols=$syms timeframe=M1 ${winArg}${tzArg}outputdir=$outDir") `
                         -CompleteCheck (New-ExportCheck -Expected $s.M1.Count) `
                         -QuiesceSec $ExportQuiesceSec -TimeoutMin $ExportTimeoutMin -Phase "export-m1-$($s.Name)"
     }
@@ -453,13 +633,16 @@ foreach ($s in $SourceList) {
             $batch = @($s.Tick[$i..([Math]::Min($i + $TickBatchSize - 1, $s.Tick.Count - 1))])
             $syms  = $batch -join ","
             Write-Host "`n--- [$($s.Name)] TICK batch $batchNum : $syms ---"
-            Invoke-QdmPhase -Lines @("-data action=export symbols=$syms timeframe=TICK ${fromArg}${tzArg}$tickFmt outputdir=$outDirF") `
+            Invoke-QdmPhase -Lines @("-data action=export symbols=$syms timeframe=TICK ${winArg}${tzArg}$tickFmt outputdir=$outDirF") `
                             -CompleteCheck (New-ExportCheck -Expected $batch.Count) `
                             -QuiesceSec $ExportQuiesceSec -TimeoutMin $ExportTimeoutMin -Phase "export-tick-$($s.Name)-b$batchNum"
             Wait-TickFolderDrained -Folder $outDir
         }
     }
 }
+
+# PHASE 4 + 5 - reconcile MT5 coverage and auto-backfill genuine gaps
+if ($ReconcileEnabled) { Invoke-Reconcile -SourceList $SourceList }
 
 $exported = @(Get-ChildItem $Mt5Common -Recurse -Filter "*.csv" |
               Where-Object { $_.DirectoryName -notmatch "\\done" }).Count
