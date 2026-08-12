@@ -7,8 +7,10 @@ If you own [QuantDataManager](https://strategyquant.com/quantdatamanager/) you a
 After a one-time setup, the pipeline runs itself:
 
 ```
-Windows Task Scheduler (daily)
-  └─ run_qdm_daily.ps1
+Windows Task Scheduler (any cadence)
+  └─ qdm-mt5-autosync.ps1
+       ├─ Phase 0: license refresh (brief GUI open/verify/close, so qdmcli never
+       │            hits an expired local license file)
        ├─ Phase 1: qdmcli -data action=update      (incremental Dukascopy download)
        ├─ Phase 2: qdmcli -data action=export      (rolling backfill CSV window)
        ├─ Phase 3: per-source tick export batches
@@ -30,7 +32,7 @@ Your EAs then backtest against `EURUSD.QDM`, `XAUUSD.QDM`, etc. — always curre
 
 | File | Runs where | Job |
 |---|---|---|
-| `run_qdm_daily.ps1` | PowerShell / Task Scheduler | Pure runner. Reads `config.json`, drives qdmcli: updates QDM's data store, exports CSVs into MT5's Common Files folder. |
+| `qdm-mt5-autosync.ps1` | PowerShell / Task Scheduler | Pure runner. Reads `config.json`, drives qdmcli: refreshes the QDM license via a brief GUI open, updates QDM's data store, exports CSVs into MT5's Common Files folder. |
 | `config.json` | (you create this, from `config.example.json`) | Every setting: QDM path, symbol lists, history depth, watchdog tuning. The only file you ever edit. |
 | `QdmImporter.mq5` | MT5 (as a **Service**) | Watches the folder, auto-creates custom symbols, imports bars/ticks. Owns *what gets imported*, via its own compiled inputs. |
 
@@ -48,44 +50,44 @@ The split is deliberate: `config.json` + the PowerShell runner fetch and organiz
 
 > Compile first, start second — recompiling a *running* service silently stops it.
 
-**2. PowerShell side.** Clone/copy this repo somewhere permanent (e.g. `D:\Trading\qdm-mt5-autosync\`). Copy `config.example.json` → `config.json` in that same folder and edit it: your QDM install path, your symbol lists (`M1Symbols`, `TickSymbols` — names must match `qdmcli -symbol action=list` **exactly**), and `FullFromDate` for how deep the initial seed should go. `run_qdm_daily.ps1` itself needs no edits — it reads everything from `config.json`, and refuses to run with a clear error if the file is missing or malformed.
+**2. PowerShell side.** Clone/copy this repo somewhere permanent (the examples below use `<repo>` as a placeholder for its full path). Copy `config.example.json` → `config.json` in that same folder and edit it: your QDM install path, your symbol lists (`M1Symbols`, `TickSymbols` — names must match `qdmcli -symbol action=list` **exactly**), and `FullFromDate` for how deep the initial seed should go. `qdm-mt5-autosync.ps1` itself needs no edits — it reads everything from `config.json`, and refuses to run with a clear error if the file is missing or malformed.
 
 **3. Register symbols** (skip for symbols already in your QDM):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File D:\Trading\qdm-mt5-autosync\run_qdm_daily.ps1 -Setup
+powershell -ExecutionPolicy Bypass -File <repo>\qdm-mt5-autosync.ps1 -Setup
 ```
 
 **4. Seed the history** (run in the evening; a multi-symbol seed with tick data works well into the night):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File D:\Trading\qdm-mt5-autosync\run_qdm_daily.ps1 -Full
+powershell -ExecutionPolicy Bypass -File <repo>\qdm-mt5-autosync.ps1 -Full
 ```
 
-**5. Schedule the daily sync.** From an elevated PowerShell prompt:
+**5. Schedule the sync.** From an elevated PowerShell prompt (any cadence you like — daily, weekly, twice a day):
 
 ```powershell
-schtasks /Create /TN "QDM-MT5-DailySync" /TR "powershell -ExecutionPolicy Bypass -File D:\Trading\qdm-mt5-autosync\run_qdm_daily.ps1" /SC DAILY /ST 09:00 /RL HIGHEST /F
+schtasks /Create /TN "QDM-MT5-AutoSync" /TR "powershell -ExecutionPolicy Bypass -File <repo>\qdm-mt5-autosync.ps1" /SC DAILY /ST 09:00 /RL HIGHEST /F
 ```
 
 Pick a time after Dukascopy publishes the previous day's data — 09:00 in your local timezone is safe. A few variations:
 
 ```powershell
 # Weekly instead of daily (e.g. Sunday evening, to catch up the whole week)
-schtasks /Create /TN "QDM-MT5-WeeklySync" /TR "powershell -ExecutionPolicy Bypass -File D:\Trading\qdm-mt5-autosync\run_qdm_daily.ps1" /SC WEEKLY /D SUN /ST 20:00 /RL HIGHEST /F
+schtasks /Create /TN "QDM-MT5-WeeklySync" /TR "powershell -ExecutionPolicy Bypass -File <repo>\qdm-mt5-autosync.ps1" /SC WEEKLY /D SUN /ST 20:00 /RL HIGHEST /F
 
 # Twice a day (morning + evening) - two separate tasks, same command
-schtasks /Create /TN "QDM-MT5-Sync-AM" /TR "powershell -ExecutionPolicy Bypass -File D:\Trading\qdm-mt5-autosync\run_qdm_daily.ps1" /SC DAILY /ST 09:00 /RL HIGHEST /F
-schtasks /Create /TN "QDM-MT5-Sync-PM" /TR "powershell -ExecutionPolicy Bypass -File D:\Trading\qdm-mt5-autosync\run_qdm_daily.ps1" /SC DAILY /ST 21:00 /RL HIGHEST /F
+schtasks /Create /TN "QDM-MT5-Sync-AM" /TR "powershell -ExecutionPolicy Bypass -File <repo>\qdm-mt5-autosync.ps1" /SC DAILY /ST 09:00 /RL HIGHEST /F
+schtasks /Create /TN "QDM-MT5-Sync-PM" /TR "powershell -ExecutionPolicy Bypass -File <repo>\qdm-mt5-autosync.ps1" /SC DAILY /ST 21:00 /RL HIGHEST /F
 
 # Trigger a run manually, any time
-schtasks /Run /TN "QDM-MT5-DailySync"
+schtasks /Run /TN "QDM-MT5-AutoSync"
 
 # Check it's registered and see next run time
-schtasks /Query /TN "QDM-MT5-DailySync" /V /FO LIST
+schtasks /Query /TN "QDM-MT5-AutoSync" /V /FO LIST
 
 # Remove it
-schtasks /Delete /TN "QDM-MT5-DailySync" /F
+schtasks /Delete /TN "QDM-MT5-AutoSync" /F
 ```
 
 `/RL HIGHEST` runs it elevated (needed for reliable process control); it runs under your own user account by default and only while you're logged in. For a machine that stays logged in as a dedicated trading user (VPS-style), that's normal and sufficient — no need for `/RU`/`/RP` service-account flags unless you specifically run headless without any interactive session.
@@ -105,6 +107,7 @@ schtasks /Delete /TN "QDM-MT5-DailySync" /F
 | `Sources.<name>.ProviderLagDays` | Expected publication delay for that source (dukascopy 0, darwinex 2). Data missing within `now − lag` is normal; anything beyond that is flagged/repaired. |
 | `Sources.<name>.BackfillWindowDays` | How far each source's exports look back (default 14). Keep it > `ProviderLagDays` so late-published provider data still lands inside the export window before it ages out. |
 | `Reconcile` | (Optional) block toggling coverage verification + auto-backfill: `Enabled`, `StatusDir`, `ProviderLagDays`, `MarginDays`, `ReportDir`. When absent, the pipeline runs as before but exports use `BackfillWindowDays`. |
+| `LicenseRefresh` | (Optional) block toggling the pre-run GUI license refresh: `Enabled` (default true), `WaitSec` (how long to wait for the GUI to reach "Pro version", default 90), `SettleSec` (extra seconds to leave the GUI open, default 10). Disable if you manage the QDM license manually, or skip per-run with `-NoLicenseRefresh`. |
 | `TickBatchSize` | Tick exports run in sequential batches of this many symbols (default 3). Bounds peak disk usage and avoids QDM silently dropping a job for a symbol already busy in another job. Between batches the script waits for the importer to drain the source's TICK folder. |
 | `MinFreeSpaceGB` | `-Full` runs abort below this free space on the MT5 Common drive (full-history tick CSVs are 5–20 GB per symbol) |
 | `Watchdog.*` | Fallback-only timing; defaults are sane, only tune if you see `FALLBACK STOP` warnings |
@@ -119,14 +122,56 @@ A note on QDM/SQX **broker profiles**: they configure broker timezone plus broke
 
 | Input | Default | Meaning |
 |---|---|---|
-| `InpWatchDir` | `QDM` | folder inside `Common\Files` (must match the PS script's `$Mt5Common` leaf) |
+| `InpUseCommonFolder` | `true` | which sandbox to watch: `true` = the shared `Common\Files` tree, `false` = **this terminal's own** `MQL5\Files`. Set `false` on a remote or containerised terminal, where the machine delivering the CSVs cannot reach the Common folder. Every file operation follows this flag. |
+| `InpWatchDir` | `QDM` | folder inside the chosen sandbox (must match the PS script's `$Mt5Common` leaf when using Common) |
 | `InpImportM1` / `InpImportTicks` | `true` | consume bar / tick exports |
 | `InpSymbolFilter` | `""` | csv of base symbols to import; empty = all |
-| `InpCustomPostfix` | `.QDM` | custom symbol naming |
+| `InpSourceFilter` | `""` | csv of **source folders** to import (`dukascopy`); empty = all. Lets several terminals share one delivered watch tree and each take only its own slice, with no per-terminal copy of the CSVs. |
+| `InpCustomPostfix` | `.QDM` | custom symbol naming — **legacy fallback only**, for files with no source subfolder. Avoid: a `.QDM` suffix collides with the broker's own symbol name in downstream tooling. Source-tagged naming (`EURUSD_dukascopy`) is the supported path. |
 | `InpBrokerSuffixes` | `,.a,.r,m,…` | suffix candidates for finding the broker symbol to clone specs from |
 | `InpDonePolicy` | `move` | `move` / `delete` / `keep` processed files |
-| `InpStatusDir` | `status` | subfolder under the watch dir where per-symbol coverage status (`<custom>.json`) is written — read by the runner's reconcile pass to auto-backfill gaps. Empty disables it. |
+| `InpStatusDir` | `status` | subfolder under the watch dir where per-symbol coverage status (`<custom>.json`) is written — read by the runner's reconcile pass to auto-backfill gaps, and by remote consumers. Empty disables it. |
+| `InpClockTag` | `""` | the timezone the CSVs were exported in (`utc` \| `eetus` \| `eet`), recorded into every status file so a consumer can never misread the bars. Leave empty only if nothing downstream reads the data. |
 | `InpScanMinutes` | `15` | folder scan interval |
+
+## Serving other machines (warehouse mode)
+
+The split above also works across hosts: this machine keeps the QDM licence and
+does all the fetching, and other MT5 estates consume what it produces. The
+service is deliberately portable — `InpUseCommonFolder=false` points it at the
+terminal's own `MQL5\Files`, `InpSourceFilter` lets each terminal take only the
+sources it should hold, and `InpClockTag` stamps the export timezone into the
+status files so no consumer has to guess.
+
+`-Build` produces the consumable artifacts — one CSV per symbol per year under
+`<Root>/<source>/<clock>/<SYMBOL>/M1/`, plus a `manifest.json` carrying a sha256
+per shard so a consumer diffs instead of re-transferring:
+
+```bash
+powershell -ExecutionPolicy Bypass -File qdm-mt5-autosync.ps1 -Build
+```
+
+It is resumable — shards already recorded in the manifest are skipped without
+launching qdmcli, and only the current year is rebuilt on every run. Scope a
+partial build with `-OnlySource`, `-OnlySymbols`, `-BuildFromYear`,
+`-BuildToYear`. Configure it via the `Warehouse` block in `config.json`.
+
+The clock is deliberately UTC (`Etc/UCT`), not the `EETUS` used for MT5 custom
+symbols: these shards feed consumers that must never route bars through a broker
+wall-clock table. The clock is part of the shard path, so it cannot be lost.
+
+`-Publish` sends a consumer host only the shards it doesn't already have:
+
+```bash
+powershell -ExecutionPolicy Bypass -File qdm-mt5-autosync.ps1 -Publish
+```
+
+It diffs the consumer's manifest on `(path, sha256)`, streams the difference over
+`ssh`+`tar`, verifies it remotely with `sha256sum`, and records **only what
+verified** — so an interrupted transfer resumes with the remainder instead of
+resending everything or reporting a success that didn't happen. Configure hosts
+in the `Consumers` block; target one with `-Publish -Consumer <name>`. It never
+touches QDM, so it skips the licence refresh and runs happily with the GUI open.
 
 ## Design notes & data facts
 
@@ -158,6 +203,17 @@ A note on QDM/SQX **broker profiles**: they configure broker timezone plus broke
 
 **`0 bars merged` for one symbol.** Usually a race: the service read the CSV while QDM was still writing it. Current versions guard against this (a file must be non-empty and size-stable over 2 s before import), so a file caught mid-write is simply retried next cycle. If it repeats for the same symbol across runs, inspect its CSV in the watch folder: zero bytes = QDM-side export issue, content present = open an issue with the first 3 lines.
 
+**Legacy `.QDM` symbols left over from before source-tagged naming.** Retire
+them: a `.QDM` suffix is *stripped* by downstream tooling that normalises broker
+symbol names (a dot-separated 1–6 letter suffix is treated as a broker feed
+marker), so `EURUSD.QDM` normalises to `EURUSD` and becomes indistinguishable
+from your broker's own symbol — which is how QDM bars end up silently answering a
+request meant for broker data. Source-tagged names (`EURUSD_dukascopy`) are safe;
+an underscore is not a stripped separator. `QdmCleanup.mq5` with
+`InpLegacyOnly=true` deletes only the legacy family, leaving the source-tagged
+symbols alone (run with `InpDryRun=true` first). MT5 must be running — deleting
+the folders on disk leaves the symbols registered in `Bases\symbols.custom.dat`.
+
 **Garbage symbol named like a date (e.g. `20260722.QDM`).** Caused by moving an archived file from `done\` back into a watch folder in very old versions; current versions reject date-stamp filenames. Never recycle `done\` files — re-export instead.
 
 **Symbol created "with defaults (no broker origin found)".** The service couldn't find a broker symbol matching the base name to clone specs from — add your broker's suffix to `InpBrokerSuffixes`, delete the defaults-based symbol, and let it recreate.
@@ -168,6 +224,22 @@ A note on QDM/SQX **broker profiles**: they configure broker timezone plus broke
 
 **Index CFDs (DAX, NDX, SP500…).** Contract specs differ meaningfully between brokers — after first import, verify contract size/tick value in the symbol specification against the broker you actually trade them with.
 
+## QDM license expiry (added 2026-08)
+
+**Why it matters.** QDM validates a locally-stored license file at every startup. The headless CLI (`qdmcli`) only *reads* that file — it can never refresh it — while the **GUI re-verifies online on every launch**. If the GUI isn't opened for a long stretch, the license file's validation window lapses and every CLI phase fails within seconds with `Missing license. / Exit app - Missing license.` (the underlying error is `License file validation has expired.`). The sync then "finishes" suspiciously fast with hours of 15-second no-ops, and no data lands in MT5.
+
+**What this repo does about it (all merged into `qdm-mt5-autosync.ps1`, no separate script/task):**
+
+1. **Pre-run license refresh (default on).** Before any `qdmcli` phase, the runner opens the QDM GUI, waits until it re-verifies online (window title reaches `Pro version`), then closes it again. This keeps the local license file fresh on *every* run — there's no harm in a brief GUI open/close, and it guarantees the headless CLI below never trips over an expired file. Tune or disable via the `LicenseRefresh` config block, or skip per-run with `-NoLicenseRefresh`.
+
+2. **Early, loud detection.** Every `qdmcli` phase still scans its log for the license-failure markers (`Missing license` / `License file validation has expired`) and aborts the run with a clear `QDM LICENSE FAILURE` message instead of silently no-op'ing — a safety net in case the refresh was skipped or the server itself is down.
+
+**If a run fails with the license error anyway** (e.g. after a long outage or if the refresh was disabled): open the QDM GUI once and confirm it shows the instrument lists / `Pro version`, close it, then re-run:
+
+```powershell
+schtasks /Run /TN "QDM-MT5-AutoSync"
+```
+
 ## Disclaimer
 
 This is a community tool, not affiliated with StrategyQuant or MetaQuotes. Historical data quality and licensing are governed by your QuantDataManager subscription. Backtest results depend on data and modelling assumptions — always validate before trading real money.
@@ -176,4 +248,4 @@ This is a community tool, not affiliated with StrategyQuant or MetaQuotes. Histo
 
 MIT — use it, fork it, ship it. If it saves you the one-by-one clicking marathon it was built to kill, a star is appreciated.
 
-*Built by [Marin Stoyanov / Algo Trading Space](https://algotradingspace.com) — algorithmic trading education, EA development, and tooling.*
+*Built for the algorithmic-trading community — data tooling, EA development, and education.*

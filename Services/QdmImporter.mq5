@@ -1,17 +1,22 @@
-//+------------------------------------------------------------------+
+﻿//+------------------------------------------------------------------+
 //|                                                  QdmImporter.mq5 |
 //|                          Algo Trading Space - QDM -> MT5 Bridge  |
 //|                                                                  |
 //| MQL5 SERVICE (not an EA). Install to: MQL5\Services\             |
-//| Watches Common\Files\QDM\ for CSV exports produced by qdmcli.exe |
-//| and imports them into MT5 custom symbols automatically:          |
+//| Watches <sandbox>\QDM\ for CSV exports produced by qdmcli.exe    |
+//| and imports them into MT5 custom symbols automatically.          |
+//| The sandbox is the shared Common\Files tree by default, or this  |
+//| terminal's own MQL5\Files when InpUseCommonFolder=false - the    |
+//| latter is what a remote/containerised terminal uses, where the   |
+//| Common folder is not reachable from the machine that delivers    |
+//| the CSVs.                                                        |
 //|   - Creates the custom symbol if missing (cloned from broker     |
 //|     symbol specs -> digits, tick size, contract size, sessions)  |
 //|   - Bars  : CustomRatesUpdate()  -> merge, idempotent            |
 //|   - Ticks : CustomTicksReplace() -> per covered window           |
 //|   - Moves processed files to QDM\done\ (or deletes them)         |
 //|                                                                  |
-//| Expected file naming (produced by run_qdm_daily.ps1):            |
+//| Expected file naming (produced by qdm-mt5-autosync.ps1):            |
 //|   <BASE>_<TF>.csv      e.g. EURUSD_M1.csv, GBPUSD_TICK.csv       |
 //|   QDM symbol postfixes are handled: EURUSD_M1_M1.csv also works, |
 //|   base symbol = leading A-Z0-9 token, TF = last known TF token.  |
@@ -24,21 +29,24 @@
 //+------------------------------------------------------------------+
 #property service
 #property copyright "Algo Trading Space"
-#property version   "1.42"
+#property version   "1.50"
 #property strict
 
 //--- === IMPORT SETTINGS ===
-input string InpWatchDir        = "QDM";      // Watch folder (inside Common\Files)
+input bool   InpUseCommonFolder = true;       // Watch Common\Files (true) or this terminal's MQL5\Files (false)
+input string InpWatchDir        = "QDM";      // Watch folder (inside the sandbox chosen above)
 input bool   InpImportM1        = true;       // Import M1 bar data
 input bool   InpImportTicks     = true;       // Import tick data
 input string InpSymbolFilter    = "";         // Import only these base symbols (csv, empty = all)
+input string InpSourceFilter    = "";         // Import only these source subfolders (csv, e.g. "dukascopy"; empty = all)
 input string InpDonePolicy      = "delete";   // After import: delete | move | keep (move archives to done\, heavy for tick seeds)
 input int    InpScanMinutes     = 15;         // Folder scan interval (minutes)
 input int    InpChunkBars       = 200000;     // Bars per CustomRatesUpdate call
 input int    InpChunkTicks      = 500000;     // Ticks per CustomTicksReplace call
 
-//--- === COVERAGE STATUS (reconcile/backfill, see docs/data-gap-backfill.md) ===
-input string InpStatusDir       = "status";   // Status subfolder under InpWatchDir (empty = disabled); run_qdm_daily.ps1 reads it to detect/backfill gaps
+//--- === COVERAGE STATUS (reconcile/backfill) ===
+input string InpStatusDir       = "status";   // Status subfolder under InpWatchDir (empty = disabled); qdm-mt5-autosync.ps1 reads it to detect/backfill gaps
+input string InpClockTag        = "";         // Timezone the CSVs were exported in (utc | eetus | eet); recorded in status so consumers cannot misread the bars
 
 //--- === SYMBOL SETTINGS ===
 input string InpCustomPostfix   = ".QDM";     // LEGACY fallback only - naming for files with no source subfolder (unused with a Sources-based config.json)
@@ -52,12 +60,23 @@ input bool   InpVerbose         = true;       // Verbose per-file logging
 //--- known timeframe tokens in filenames
 string g_TfTokens[] = {"TICK","M1","M5","M15","M30","H1","H4","D1"};
 string g_Filter[];                             // parsed InpSymbolFilter
+string g_SrcFilter[];                          // parsed InpSourceFilter
+int    g_FileFlag = FILE_COMMON;               // sandbox selector: FILE_COMMON or 0 (terminal-local)
+
+//--- import outcomes. "no data" is NOT an error: QDM emits a CSV even when the
+//--- requested range holds nothing (0 bytes for bars, a lone header line for
+//--- ticks), and such a file must be retired rather than retried forever.
+#define IMPORT_ERROR  (-1)
+#define IMPORT_NODATA (0)
+#define IMPORT_OK     (1)
 
 //+------------------------------------------------------------------+
 //| Service entry point                                              |
 //+------------------------------------------------------------------+
 void OnStart()
   {
+   g_FileFlag = InpUseCommonFolder ? FILE_COMMON : 0;
+
    // parse symbol filter once
    ArrayResize(g_Filter, 0);
    if(StringLen(InpSymbolFilter) > 0)
@@ -68,12 +87,29 @@ void OnStart()
       StringSplit(f, ',', g_Filter);
      }
 
-   string fullPath = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\Files\\" + InpWatchDir;
-   PrintFormat("[QdmImporter] service started. Watch folder: %s | M1=%s Ticks=%s Filter=%s | scan every %d min",
+   // parse source filter once (folder names are compared case-insensitively,
+   // so both sides are lowered rather than uppered - source tags are lowercase)
+   ArrayResize(g_SrcFilter, 0);
+   if(StringLen(InpSourceFilter) > 0)
+     {
+      string s = InpSourceFilter;
+      StringToLower(s);
+      StringReplace(s, " ", "");
+      StringSplit(s, ',', g_SrcFilter);
+     }
+
+   string sandbox  = InpUseCommonFolder ? TerminalInfoString(TERMINAL_COMMONDATA_PATH)
+                                        : TerminalInfoString(TERMINAL_DATA_PATH);
+   string fullPath = sandbox + "\\MQL5\\Files\\" + InpWatchDir;
+   if(InpUseCommonFolder)
+      fullPath = sandbox + "\\Files\\" + InpWatchDir;
+   PrintFormat("[QdmImporter] service started. Watch folder: %s | M1=%s Ticks=%s Symbols=%s Sources=%s clock=%s | scan every %d min",
                fullPath,
                InpImportM1 ? "on" : "off",
                InpImportTicks ? "on" : "off",
                (ArraySize(g_Filter) == 0) ? "all" : InpSymbolFilter,
+               (ArraySize(g_SrcFilter) == 0) ? "all" : InpSourceFilter,
+               (InpClockTag == "") ? "(unset)" : InpClockTag,
                InpScanMinutes);
 
    while(!IsStopped())
@@ -116,7 +152,7 @@ int ScanTypeDir(const string tfTag)
    string root  = InpWatchDir + "\\" + tfTag;
    int    count = ScanFolder(root, tfTag, "");              // untagged files in the type root
    string entry;
-   long   handle = FileFindFirst(root + "\\*", entry, FILE_COMMON);
+   long   handle = FileFindFirst(root + "\\*", entry, g_FileFlag);
    if(handle == INVALID_HANDLE)
       return count;
    string subs[];
@@ -134,7 +170,11 @@ int ScanTypeDir(const string tfTag)
    FileFindClose(handle);
 
    for(int i = 0; i < ArraySize(subs); i++)
+     {
+      if(!SourceAllowed(subs[i]))
+         continue;                                          // this terminal does not take that source
       count += ScanFolder(root + "\\" + subs[i], tfTag, subs[i]);
+     }
    return count;
   }
 
@@ -147,7 +187,7 @@ int ScanFolder(const string dir, const string forceTf, const string srcTag)
    int    count = 0;
    string fname;
    string mask   = dir + "\\*.csv";
-   long   handle = FileFindFirst(mask, fname, FILE_COMMON);
+   long   handle = FileFindFirst(mask, fname, g_FileFlag);
    if(handle == INVALID_HANDLE)
       return 0;
 
@@ -170,11 +210,14 @@ int ScanFolder(const string dir, const string forceTf, const string srcTag)
             PrintFormat("[QdmImporter] %s still being written (or empty) - will retry next cycle", files[i]);
          continue;
         }
-      if(ImportFile(path, files[i], forceTf, srcTag))
+      bool noData = false;
+      if(ImportFile(path, files[i], forceTf, srcTag, noData))
         {
          count++;
          FinishFile(path, files[i], forceTf, srcTag);
         }
+      else if(noData)
+         FinishFile(path, files[i], forceTf, srcTag);   // retire it; it can never import
      }
    return count;
   }
@@ -187,10 +230,11 @@ int ScanFolder(const string dir, const string forceTf, const string srcTag)
 //+------------------------------------------------------------------+
 bool IsFileStable(const string path)
   {
-   long sz = FileGetInteger(path, FILE_SIZE, true);
+   bool common = (g_FileFlag == FILE_COMMON);
+   long sz = FileGetInteger(path, FILE_SIZE, common);
    if(sz <= 0)
       return false;                                   // missing or empty
-   datetime mod = (datetime)FileGetInteger(path, FILE_MODIFY_DATE, true);
+   datetime mod = (datetime)FileGetInteger(path, FILE_MODIFY_DATE, common);
    if(mod <= 0)
       return false;
    if(TimeLocal() - mod < 60)
@@ -201,8 +245,10 @@ bool IsFileStable(const string path)
 //+------------------------------------------------------------------+
 //| Import one CSV file                                              |
 //+------------------------------------------------------------------+
-bool ImportFile(const string path, const string fname, const string forceTf, const string srcTag)
+bool ImportFile(const string path, const string fname, const string forceTf, const string srcTag,
+                bool &noData)
   {
+   noData = false;
    string base, tf;
    if(!ParseFileName(fname, base, tf))
      {
@@ -237,21 +283,37 @@ bool ImportFile(const string path, const string fname, const string forceTf, con
    if(!EnsureCustomSymbol(custom, base, treePath))
       return false;
 
-   bool ok;
-   datetime lastBar  = 0;
-   datetime lastTick = 0;
+   int res;
+   datetime firstBar = 0, lastBar  = 0;
+   datetime firstTick = 0, lastTick = 0;
+   long     rows = 0;
    if(tf == "TICK")
-      ok = ImportTicks(path, custom, lastTick);
+      res = ImportTicks(path, custom, firstTick, lastTick, rows);
    else
-      ok = ImportBars(path, custom, lastBar);
+      res = ImportBars(path, custom, firstBar, lastBar, rows);
 
-   if(ok)
+   if(res == IMPORT_OK)
      {
       if(InpVerbose)
          PrintFormat("[QdmImporter] OK  %s -> %s (%s)", fname, custom, tf);
-      WriteStatus(custom, srcTag, tf, lastBar, lastTick);
+      if(tf == "TICK")
+         WriteStatus(custom, base, srcTag, tf, 0, 0, 0, firstTick, lastTick, rows);
+      else
+         WriteStatus(custom, base, srcTag, tf, firstBar, lastBar, rows, 0, 0, 0);
+      return true;
      }
-   return ok;
+
+   if(res == IMPORT_NODATA)
+     {
+      // The file passed IsFileStable (non-empty, untouched for 60 s) and still
+      // parsed to zero rows: QDM exported a range it has no data for. Nothing
+      // will ever make it importable, so retire it per the done policy instead
+      // of re-reading it every scan cycle forever - which also blocks the
+      // runner's drain wait on every batch until someone deletes it by hand.
+      PrintFormat("[QdmImporter] no data in %s - retiring it (QDM exported an empty range)", fname);
+      noData = true;
+     }
+   return false;
   }
 
 //+------------------------------------------------------------------+
@@ -370,20 +432,22 @@ string FindBrokerSymbol(const string base)
 //+------------------------------------------------------------------+
 //| BAR IMPORT                                                       |
 //+------------------------------------------------------------------+
-bool ImportBars(const string path, const string custom, datetime &lastBar)
+int  ImportBars(const string path, const string custom, datetime &firstBar, datetime &lastBar, long &rows)
    {
-    int fh = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI | FILE_COMMON);
+    int fh = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI | g_FileFlag);
     if(fh == INVALID_HANDLE)
       {
        PrintFormat("[QdmImporter] cannot open %s, err=%d", path, GetLastError());
-       return false;
+       return IMPORT_ERROR;
       }
 
     MqlRates rates[];
     ArrayResize(rates, 0, InpChunkBars);
     long totalBars = 0;
     int  badLines  = 0;
-    lastBar = 0;
+    firstBar = 0;
+    lastBar  = 0;
+    rows     = 0;
 
     while(!FileIsEnding(fh))
       {
@@ -400,6 +464,8 @@ bool ImportBars(const string path, const string custom, datetime &lastBar)
 
        if(r.time > lastBar)
           lastBar = r.time;
+       if(firstBar == 0 || r.time < firstBar)
+          firstBar = r.time;
 
        int n = ArraySize(rates);
        ArrayResize(rates, n + 1, InpChunkBars);
@@ -410,7 +476,7 @@ bool ImportBars(const string path, const string custom, datetime &lastBar)
           if(!FlushBars(custom, rates))
             {
              FileClose(fh);
-             return false;
+             return IMPORT_ERROR;
             }
           totalBars += ArraySize(rates);
           ArrayResize(rates, 0, InpChunkBars);
@@ -421,13 +487,14 @@ bool ImportBars(const string path, const string custom, datetime &lastBar)
    if(ArraySize(rates) > 0)
      {
       if(!FlushBars(custom, rates))
-         return false;
+         return IMPORT_ERROR;
       totalBars += ArraySize(rates);
      }
 
+   rows = totalBars;
    if(InpVerbose)
       PrintFormat("[QdmImporter] %s: %I64d bars merged (%d unparsed lines skipped)", custom, totalBars, badLines);
-   return (totalBars > 0);
+   return (totalBars > 0) ? IMPORT_OK : IMPORT_NODATA;
   }
 
 //+------------------------------------------------------------------+
@@ -501,20 +568,22 @@ bool ParseBarLine(const string line, MqlRates &r)
 //+------------------------------------------------------------------+
 //| TICK IMPORT                                                      |
 //+------------------------------------------------------------------+
-bool ImportTicks(const string path, const string custom, datetime &lastTick)
+int  ImportTicks(const string path, const string custom, datetime &firstTick, datetime &lastTick, long &rows)
    {
-    int fh = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI | FILE_COMMON);
+    int fh = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI | g_FileFlag);
     if(fh == INVALID_HANDLE)
       {
        PrintFormat("[QdmImporter] cannot open %s, err=%d", path, GetLastError());
-       return false;
+       return IMPORT_ERROR;
       }
 
     MqlTick ticks[];
     ArrayResize(ticks, 0, InpChunkTicks);
     long totalTicks = 0;
     int  badLines   = 0;
-    lastTick = 0;
+    firstTick = 0;
+    lastTick  = 0;
+    rows      = 0;
 
     while(!FileIsEnding(fh))
       {
@@ -532,6 +601,8 @@ bool ImportTicks(const string path, const string custom, datetime &lastTick)
        datetime tsec = (datetime)(t.time_msc / 1000);
        if(tsec > lastTick)
           lastTick = tsec;
+       if(firstTick == 0 || tsec < firstTick)
+          firstTick = tsec;
 
        int n = ArraySize(ticks);
        ArrayResize(ticks, n + 1, InpChunkTicks);
@@ -542,7 +613,7 @@ bool ImportTicks(const string path, const string custom, datetime &lastTick)
           if(!FlushTicks(custom, ticks))
             {
              FileClose(fh);
-             return false;
+             return IMPORT_ERROR;
             }
           totalTicks += ArraySize(ticks);
           ArrayResize(ticks, 0, InpChunkTicks);
@@ -553,13 +624,14 @@ bool ImportTicks(const string path, const string custom, datetime &lastTick)
    if(ArraySize(ticks) > 0)
      {
       if(!FlushTicks(custom, ticks))
-         return false;
+         return IMPORT_ERROR;
       totalTicks += ArraySize(ticks);
      }
 
+   rows = totalTicks;
    if(InpVerbose)
       PrintFormat("[QdmImporter] %s: %I64d ticks replaced (%d unparsed lines skipped)", custom, totalTicks, badLines);
-   return (totalTicks > 0);
+   return (totalTicks > 0) ? IMPORT_OK : IMPORT_NODATA;
   }
 
 //+------------------------------------------------------------------+
@@ -669,6 +741,25 @@ bool SymbolAllowed(const string base)
   }
 
 //+------------------------------------------------------------------+
+//| Source gate. Lets several terminals share one delivered watch     |
+//| tree and each take only the sources it is meant to hold - e.g.    |
+//| one terminal on dukascopy only, another on darwinex only, with    |
+//| no per-terminal copy of the CSVs.                                 |
+//+------------------------------------------------------------------+
+bool SourceAllowed(const string srcTag)
+  {
+   int n = ArraySize(g_SrcFilter);
+   if(n == 0)
+      return true;                 // empty filter = take every source folder
+   string s = srcTag;
+   StringToLower(s);
+   for(int i = 0; i < n; i++)
+      if(g_SrcFilter[i] == s)
+         return true;
+   return false;
+  }
+
+//+------------------------------------------------------------------+
 bool IsAllDigits(const string s)
   {
    int len = StringLen(s);
@@ -708,7 +799,7 @@ void FinishFile(const string path, const string fname, const string tfTag, const
   {
    if(InpDonePolicy == "delete")
      {
-      FileDelete(path, FILE_COMMON);
+      FileDelete(path, g_FileFlag);
       return;
      }
    if(InpDonePolicy == "keep")
@@ -721,67 +812,120 @@ void FinishFile(const string path, const string fname, const string tfTag, const
    if(srcTag != "")
       tagPart += srcTag + "_";
    string dst = InpWatchDir + "\\done\\" + stamp + "_" + tagPart + fname;
-   if(!FileMove(path, FILE_COMMON, dst, FILE_REWRITE | FILE_COMMON))
+   if(!FileMove(path, g_FileFlag, dst, FILE_REWRITE | g_FileFlag))
       PrintFormat("[QdmImporter] warn: could not move %s to done\\, err=%d", fname, GetLastError());
   }
 
 //+------------------------------------------------------------------+
-//| Coverage status (docs/data-gap-backfill.md). Writes per-symbol   |
-//| JSON under <watch>\<InpStatusDir>\<custom>.json so the runner    |
-//| (run_qdm_daily.ps1 reconcile pass) can verify what MT5 actually  |
-//| holds and auto-backfill late-published provider data.            |
-//| Status is written on every successful import, independent of the |
-//| DonePolicy (file may be kept/deleted after, the record persists).|
+//| Read one integer field out of a flat JSON object. The status file |
+//| is deliberately FLAT (no nesting) so this three-line reader is    |
+//| enough and MQL5 never needs a JSON parser.                        |
 //+------------------------------------------------------------------+
-void WriteStatus(const string custom, const string srcTag, const string tf,
-                 const datetime lastBar, const datetime lastTick)
+long ReadJsonLong(const string json, const string key)
+  {
+   int k = StringFind(json, "\"" + key + "\"");
+   if(k < 0)
+      return 0;
+   int c = StringFind(json, ":", k);
+   if(c < 0)
+      return 0;
+   return StringToInteger(StringSubstr(json, c + 1, 20));
+  }
+
+//+------------------------------------------------------------------+
+//| Escape a string for JSON. Only backslash and quote occur in the   |
+//| values written here (Windows paths), but both must be escaped or  |
+//| every consumer's JSON.parse fails on the terminal path.           |
+//+------------------------------------------------------------------+
+string JsonEscape(const string s)
+  {
+   string out = s;
+   StringReplace(out, "\\", "\\\\");
+   StringReplace(out, "\"", "\\\"");
+   return out;
+  }
+
+//+------------------------------------------------------------------+
+//| Coverage status (schema 2). Writes one flat per-symbol JSON under |
+//| <watch>\<InpStatusDir>\<custom>.json. Two consumers read it:      |
+//|   - qdm-mt5-autosync.ps1's reconcile pass, to detect and backfill |
+//|     late-published provider data (uses lastBarTime/lastTickTime); |
+//|   - the Backtest Manager's source-coverage surface, which needs   |
+//|     the FULL span (first..last) per timeframe plus the clock the  |
+//|     bars are stamped in, to decide whether a cross-data run can   |
+//|     even be queued.                                               |
+//|                                                                   |
+//| Schema 1's two fields (lastBarTime/lastTickTime) are still        |
+//| written, unchanged, so an older runner keeps working.             |
+//| Written on every successful import, independent of DonePolicy:    |
+//| the CSV may be deleted right after, the record persists.          |
+//+------------------------------------------------------------------+
+void WriteStatus(const string custom, const string base, const string srcTag, const string tf,
+                 const datetime firstBar,  const datetime lastBar,  const long barRows,
+                 const datetime firstTick, const datetime lastTick, const long tickRows)
   {
    if(InpStatusDir == "")
       return;
 
    string dir = InpWatchDir + "\\" + InpStatusDir;
-   FolderCreate(dir, FILE_COMMON);
+   FolderCreate(dir, g_FileFlag);
 
    string path = dir + "\\" + custom + ".json";
 
-   // read existing record so a M1 write doesn't clobber the TICK value and vice versa
-   datetime prevBar  = 0;
-   datetime prevTick = 0;
-   int rf = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   // merge with the existing record: a M1 write must not clobber the TICK
+   // values and vice versa, and first-seen times only ever widen backwards
+   datetime prevBarFirst = 0, prevBar = 0, prevTickFirst = 0, prevTick = 0;
+   long prevBarRows = 0, prevTickRows = 0;
+   int rf = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI | g_FileFlag);
    if(rf != INVALID_HANDLE)
      {
       string all = "";
       while(!FileIsEnding(rf))
          all += FileReadString(rf, 32768);
       FileClose(rf);
-      // crude scan for the two timestamps: "lastBarTime":"...","lastTickTime":"..."
-      int b = StringFind(all, "\"lastBarTime\"");
-      int t = StringFind(all, "\"lastTickTime\"");
-      prevBar  = (b >= 0) ? (datetime)StringToInteger(StringSubstr(all, StringFind(all, ":", b) + 1, 10)) : 0;
-      prevTick = (t >= 0) ? (datetime)StringToInteger(StringSubstr(all, StringFind(all, ":", t) + 1, 10)) : 0;
+      prevBar       = (datetime)ReadJsonLong(all, "lastBarTime");
+      prevTick      = (datetime)ReadJsonLong(all, "lastTickTime");
+      prevBarFirst  = (datetime)ReadJsonLong(all, "barFirstTime");
+      prevTickFirst = (datetime)ReadJsonLong(all, "tickFirstTime");
+      prevBarRows   = ReadJsonLong(all, "barRowsLast");
+      prevTickRows  = ReadJsonLong(all, "tickRowsLast");
      }
 
-   if(lastBar > prevBar)     prevBar  = lastBar;
-   if(lastTick > prevTick)   prevTick = lastTick;
+   if(lastBar  > prevBar)   prevBar  = lastBar;
+   if(lastTick > prevTick)  prevTick = lastTick;
+   if(firstBar  > 0 && (prevBarFirst  == 0 || firstBar  < prevBarFirst))  prevBarFirst  = firstBar;
+   if(firstTick > 0 && (prevTickFirst == 0 || firstTick < prevTickFirst)) prevTickFirst = firstTick;
+   if(barRows  > 0) prevBarRows  = barRows;
+   if(tickRows > 0) prevTickRows = tickRows;
 
-   int wf = FileOpen(path, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   int wf = FileOpen(path, FILE_WRITE | FILE_TXT | FILE_ANSI | g_FileFlag);
    if(wf == INVALID_HANDLE)
      {
       PrintFormat("[QdmImporter] cannot write status %s, err=%d", path, GetLastError());
       return;
      }
    string body = "{";
+   body += "\"schema\":2,";
    body += "\"symbol\":\"" + custom + "\",";
+   body += "\"base\":\"" + base + "\",";
    body += "\"source\":\"" + srcTag + "\",";
+   body += "\"clock\":\"" + InpClockTag + "\",";
    body += "\"tf\":\"" + tf + "\",";
-   body += "\"lastBarTime\":" + IntegerToString((long)prevBar, 0) + ",";
-   body += "\"lastTickTime\":" + IntegerToString((long)prevTick, 0) + ",";
+   body += "\"terminalPath\":\"" + JsonEscape(TerminalInfoString(TERMINAL_DATA_PATH)) + "\",";
+   body += "\"barFirstTime\":"  + IntegerToString((long)prevBarFirst, 0) + ",";
+   body += "\"lastBarTime\":"   + IntegerToString((long)prevBar, 0) + ",";
+   body += "\"barRowsLast\":"   + IntegerToString(prevBarRows, 0) + ",";
+   body += "\"tickFirstTime\":" + IntegerToString((long)prevTickFirst, 0) + ",";
+   body += "\"lastTickTime\":"  + IntegerToString((long)prevTick, 0) + ",";
+   body += "\"tickRowsLast\":"  + IntegerToString(prevTickRows, 0) + ",";
+   body += "\"updatedEpoch\":"  + IntegerToString((long)TimeGMT(), 0) + ",";
    body += "\"updated\":\"" + TimeToString(TimeLocal(), TIME_DATE | TIME_SECONDS) + "\"";
    body += "}";
    FileWrite(wf, body);
    FileClose(wf);
 
    if(InpVerbose)
-      PrintFormat("[QdmImporter] status %s: bar=%ld tick=%ld", custom, (long)prevBar, (long)prevTick);
+      PrintFormat("[QdmImporter] status %s: bars %ld..%ld ticks %ld..%ld",
+                  custom, (long)prevBarFirst, (long)prevBar, (long)prevTickFirst, (long)prevTick);
   }
 //+------------------------------------------------------------------+

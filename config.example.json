@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy this file to config.json (same folder as run_qdm_daily.ps1) and edit. Symbols are grouped by data source; each source can have its own export timezone.",
+  "_comment": "Copy this file to config.json (same folder as qdm-mt5-autosync.ps1) and edit. Symbols are grouped by data source; each source can have its own export timezone.",
   "QdmDir": "D:\\Trading\\QuantDataManager124",
   "Mt5CommonOverride": "",
   "_Mt5CommonOverride_comment": "Leave empty to auto-use %APPDATA%\\MetaQuotes\\Terminal\\Common\\Files\\QDM. Set only for portable/non-standard MT5 installs.",
@@ -22,6 +22,44 @@
     "MarginDays": 1,
     "_MarginDays_comment": "Extra tolerance on top of lag before a day counts as a genuine gap (absorbs timezone/day-boundary fuzz).",
     "ReportDir": ""
+  },
+  "Warehouse": {
+    "_comment": "(Optional) Build reusable, per-year CSV shards plus a manifest, so other machines can consume this box's history without a QDM licence. Used by -Build and -Publish; absent = those switches error out.",
+    "Root": "D:\\QdmWarehouse",
+    "Clock": "utc",
+    "_Clock_comment": "Label recorded in the shard path and the manifest. The clock a consumer must assume when reading these bars. 'utc' is the only safe choice for the reconstruction feed - it never passes through a broker wall-clock table.",
+    "Timezone": "Etc/UCT",
+    "_Timezone_comment": "The qdmcli timezone= value that produces the clock above. Etc/UCT = true UTC. Keep the two consistent: the path label is what consumers trust.",
+    "Timeframes": ["M1"],
+    "_Timeframes_comment": "Only M1 is sharded by year. Ticks are backtest-only and stay in the MT5 store; sharding them here would be tens of GB for no consumer.",
+    "Sources": [],
+    "_Sources_comment": "Empty = every source in the Sources block above. Name sources to limit the build.",
+    "FromYear": 2011,
+    "_FromYear_comment": "First year to shard. Shards already present with a matching manifest entry are skipped, so a re-run is cheap and resumable.",
+    "ToYear": 0,
+    "_ToYear_comment": "Last year to shard; 0 = current year. The current year's shard is always rebuilt, since it grows daily."
+  },
+  "Consumers": {
+    "_comment": "(Optional) Hosts that receive warehouse shards via -Publish. Transfer is a manifest diff on (path, sha256) streamed over ssh+tar, verified remotely with sha256sum, and only then recorded - so an interrupted publish resumes with the remainder instead of resending everything. Key = consumer name, used by -Publish -Consumer <name>.",
+    "backtester": {
+      "Host": "backtester",
+      "_Host_comment": "An ssh alias or user@host. Key-based auth only; -Publish never prompts.",
+      "RemoteRoot": "/data/mt5-shared/qdm/shards",
+      "Classes": ["csv-shard"],
+      "Sources": [],
+      "_Sources_comment": "Empty = every source in the manifest. Name sources to send a subset.",
+      "Timeframes": ["M1"],
+      "Clocks": ["utc"],
+      "_Clocks_comment": "Which clock this consumer takes. The reconstruction feed takes 'utc' and must never be handed EETUS bars."
+    }
+  },
+  "LicenseRefresh": {
+    "_comment": "(Optional) Before any qdmcli phase, briefly open the QDM GUI so its online license verification refreshes the local license file (qdmcli can only read it, never refresh it). Prevents silent 'Missing license' no-op runs after a long stretch without the GUI. Disable only if you manage the license manually. Override per-run with -NoLicenseRefresh.",
+    "Enabled": true,
+    "_WaitSec_comment": "Max seconds to wait for the GUI to show 'Pro version' after opening.",
+    "WaitSec": 90,
+    "_SettleSec_comment": "Seconds to leave the GUI open after verification before closing it.",
+    "SettleSec": 10
   },
   "Sources": {
     "_comment": "Key = QDM datasource name (dukascopy, darwinex, crypto, yahoo...). Missing symbols are auto-registered with that source. Timezone is applied to exports via the CLI timezone= parameter and shifts every timestamp - Dukascopy's raw feed is UTC-native, so EETUS (UTC+2/UTC+3 with US DST) makes bars/ticks match a typical MT5 broker's server time. IMPORTANT: changing a source's Timezone after symbols already have imported data means old (differently-shifted) and new bars will misalign - wipe the affected custom symbols and re-seed with -Full after any Timezone change. Custom symbols in MT5 are named <SYMBOL>_<source>.",
@@ -101,8 +139,13 @@
     "_comment": "Completion is normally detected via qdmcli self-exit or log markers. These values are only the last-resort fallback.",
     "UpdateQuiesceSec": 900,
     "UpdateTimeoutMin": 720,
+    "_Redownload_comment": "A full refetch downloads years, not days, so both its stdout and its disk flushes come in long bursts and it needs a far wider quiet window than a daily update. Liveness is judged on the log AND the QDM store tree together: a phase counts as quiet only when neither has moved.",
+    "RedownloadQuiesceSec": 3600,
+    "RedownloadTimeoutMin": 2880,
     "ExportQuiesceSec": 600,
     "ExportTimeoutMin": 480,
-    "MinPhaseRunSec": 120
+    "MinPhaseRunSec": 120,
+    "DrainWaitMin": 90,
+    "_DrainWaitMin_comment": "Max minutes to wait between tick batches for QdmImporter to consume the previous batch. No-data exports are removed rather than waited on, and if MT5 isn't running at all the wait is skipped outright (with a warning, and an abort if free space is already below MinFreeSpaceGB)."
   }
 }

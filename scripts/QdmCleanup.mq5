@@ -19,7 +19,35 @@
 #property strict
 
 input string InpPathPrefix = "Custom\\QDM";  // Delete every custom symbol whose path starts with this
+input bool   InpLegacyOnly = false;          // true = delete ONLY legacy <SYM><postfix> symbols, keeping the source-tagged ones
+input string InpLegacyPostfix = ".QDM";      // The legacy postfix InpLegacyOnly matches on (must equal the service's InpCustomPostfix)
 input bool   InpDryRun     = false;          // true = list what WOULD be deleted, delete nothing
+
+//+------------------------------------------------------------------+
+//| Legacy naming check.                                              |
+//|                                                                   |
+//| Source-tagged symbols (EURUSD_dukascopy) live one level deeper,   |
+//| at Custom\QDM\<source>, so a bare prefix match on Custom\QDM      |
+//| catches BOTH families - which is right for a full wipe and wrong  |
+//| for retiring only the legacy ones.                                |
+//|                                                                   |
+//| Worth retiring on its own: a ".QDM" suffix is stripped by the     |
+//| Backtest Manager's normalizeSymbol (it removes a dot-separated    |
+//| 1-6 letter suffix), so EURUSD.QDM normalises to EURUSD and        |
+//| becomes indistinguishable from the broker's own symbol in any     |
+//| tooling that reads this terminal's history. The source-tagged     |
+//| names are safe - an underscore is not a stripped separator.       |
+//+------------------------------------------------------------------+
+bool IsLegacyName(const string name, const string path)
+  {
+   int plen = StringLen(InpLegacyPostfix);
+   if(plen <= 0)
+      return false;
+   if(StringSubstr(name, StringLen(name) - plen) != InpLegacyPostfix)
+      return false;
+   // and it must sit directly in the prefix folder, not in a source subfolder
+   return (path == InpPathPrefix);
+  }
 
 void OnStart()
   {
@@ -35,19 +63,25 @@ void OnStart()
       string path = SymbolInfoString(name, SYMBOL_PATH);
       if(StringFind(path, InpPathPrefix) != 0)
          continue;
+      if(InpLegacyOnly && !IsLegacyName(name, path))
+         continue;
 
       ArrayResize(toDelete, n + 1);
       toDelete[n] = name;
       n++;
      }
 
+   string scope = InpLegacyOnly
+                  ? StringFormat("legacy '%s' symbols directly under '%s'", InpLegacyPostfix, InpPathPrefix)
+                  : StringFormat("custom symbols under '%s'", InpPathPrefix);
+
    if(n == 0)
      {
-      PrintFormat("[QdmCleanup] No custom symbols found under '%s'. Nothing to do.", InpPathPrefix);
+      PrintFormat("[QdmCleanup] No %s. Nothing to do.", scope);
       return;
      }
 
-   PrintFormat("[QdmCleanup] Found %d custom symbol(s) under '%s':", n, InpPathPrefix);
+   PrintFormat("[QdmCleanup] Found %d %s:", n, scope);
    for(int i = 0; i < n; i++)
       PrintFormat("[QdmCleanup]   %s", toDelete[i]);
 
